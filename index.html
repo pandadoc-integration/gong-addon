@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PandaDoc for Gong</title>
+    <link
+      rel="stylesheet"
+      href="https://pd-js-sdk.s3.amazonaws.com/latest/pandadoc-js-sdk.css"
+    />
+    <style>
+      /* Fill exactly the iframe Gong gives us — its height differs per page (account tab,
+         deal tab with the taller header, composer) and Gong's frame doesn't scroll, so the
+         page must never be taller than the viewport. Scrolling happens inside the
+         PandaDoc SDK iframe. */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu,
+          Cantarell, sans-serif;
+        overflow: hidden;
+        width: 100%;
+        min-width: 280px;
+        height: 100%;
+      }
+
+      #pandadoc-container {
+        width: 100%;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      /* The SDK renders <div class="pandadoc-gong"><iframe/></div>; the wrapper must carry
+         the height or the iframe's 100% collapses. */
+      .pandadoc-gong {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .pandadoc-gong iframe,
+      #pandadoc-container iframe {
+        width: 100%;
+        height: 100%;
+        flex: 1;
+        min-height: 0;
+        border: none;
+      }
+
+      .loading {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        font-size: 16px;
+        color: #666;
+      }
+
+      .error {
+        color: red;
+      }
+
+      /* Host bar above the workflow runner (the runner has no close event of its own) */
+      .back-bar {
+        flex: none;
+        padding: 8px 12px;
+        border-bottom: 1px solid #e4e7eb;
+      }
+
+      .back-bar button {
+        border: none;
+        background: none;
+        padding: 4px 8px;
+        font-size: 14px;
+        color: #47b972;
+        cursor: pointer;
+      }
+
+      .runner-host {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="pandadoc-container">
+      <div class="loading">Loading PandaDoc...</div>
+    </div>
+
+    <script>
+      /**
+       * Minimal inline port of @gong.io/frontend-sdk (v0.9.7).
+       *
+       * The official package ships only as a CommonJS module and Gong blocks
+       * 3rd-party origins inside the composer iframe, so the postMessage
+       * protocol is reproduced here instead of loading it from a CDN.
+       *
+       * Protocol: { $gong: true, id, type: 'request'|'response', name, data }
+       * Methods:  ready(), close(), closeWithContent({ html }), closeWithError(error)
+       */
+      var GongSdk = (function () {
+        var GONG_HOST_SUFFIX = '.app.gong.io';
+        var REQUEST_TIMEOUT_MS = 10 * 1000;
+        var MAX_CONCURRENT_REQUESTS = 3;
+
+        function Channel(config) {
+          this.config = config;
+          this.lastRequestId = 0;
+          this.requests = new Map();
+          window.addEventListener('message', this.onMessage.bind(this), false);
+        }
+
+        Channel.prototype.verifyOrigin = function (event) {
+          if (this.config.gongOrigin) {
+            return this.config.gongOrigin === event.origin;
+          }
+          try {
+            return new URL(event.origin).hostname.endsWith(GONG_HOST_SUFFIX);
+          } catch (e) {
+            return false;
+          }
+        };
+
+        Channel.prototype.onMessage = function (event) {
+          if (event.source !== this.config.gongWindow) return;
+          if (!this.verifyOrigin(event)) {
+            console.warn('gong: unrecognized source origin', event.origin);
+            return;
+          }
+          var msg = event.data;
+          if (!msg || msg.$gong !== true) return;
+          if (msg.type !== 'response') {
+            console.warn('gong: bad message type', msg.type);
+            return;
+          }
+          var pending = this.requests.get(msg.id);
+          if (!pending) return;
+          clearTimeout(pending.timer);
+          this.requests.delete(msg.id);
+          pending.resolve(msg.data);
+        };
+
+        Channel.prototype.request = function (name, data) {
+          var self = this;
+          if (this.requests.size > MAX_CONCURRENT_REQUESTS) {
+            return Promise.reject(new Error('Too many concurrent requests'));
+          }
+          var msg = {
+            $gong: true,
+            id: String(this.lastRequestId++),
+            type: 'request',
+            name: name,
+            data: data,
+          };
+          this.config.gongWindow.postMessage(msg, this.config.gongOrigin || '*');
+          return new Promise(function (resolve, reject) {
+            var timer = setTimeout(function () {
+              self.requests.delete(msg.id);
+              reject(new Error('Timeout waiting for response'));
+            }, REQUEST_TIMEOUT_MS);
+            self.requests.set(msg.id, { resolve: resolve, timer: timer });
+          });
+        };
+
+        function Api(channel) {
+          this.channel = channel;
+        }
+        Api.prototype.ready = function () {
+          return this.channel.request('ready');
+        };
+        Api.prototype.close = function () {
+          return this.channel.request('close');
+        };
+        Api.prototype.closeWithContent = function (content) {
+          return this.channel.request('closeWithContent', content);
+        };
+        Api.prototype.closeWithError = function (error) {
+          return this.channel.request('closeWithError', { error: error });
+        };
+
+        return {
+          init: function (config) {
+            return new Api(new Channel(config));
+          },
+        };
+      })();
+    </script>
+
+    <script>
+      var gong = GongSdk.init({ gongWindow: window.parent });
+      var PROVIDER = { name: 'gong' };
+      // Entity type naming must match the Gong integration on the PandaDoc backend
+      // (Copper uses plurals like `companies`, HubSpot uses singular `company`).
+      var ENTITY_TYPE = 'accounts';
+      var ENTITY_TYPE_SINGULAR = 'account';
+      var PANDADOC_SDK_URL = 'https://pd-js-sdk.s3.amazonaws.com/latest/pandadoc-js-sdk.js';
+
+      /**
+       * Gong account id for the current iframe.
+       *
+       * Gong appends `?account-id=<id>` when the integration is opened from the Engage
+       * Account tab or from a deal (the deal view reuses the same Account information
+       * iframe; Gong passes no deal id). The email composer passes nothing.
+       * Gong's docs spell the param `accountId`; the hyphenated form is what is sent.
+       */
+      function getGongAccountId() {
+        var params = new URLSearchParams(window.location.search);
+        return params.get('account-id') || params.get('accountId') || null;
+      }
+
+      /**
+       * SDK `data` for a Gong account. The SDK app turns it into the Flow Wizard payload:
+       *
+       *   link_data:       { integration_name: 'gong', entity_type: 'accounts', entity_id }
+       *                    ← initOptions.provider + data.sourceEntity
+       *   init_data_items: [{ name: 'account.id', type: 'text', value: entity_id }]
+       *                    ← data.variables (Gong has no entity-data API, so the host page
+       *                      supplies whatever it knows; Gong only gives us the account id)
+       *   trigger_details: { integration_name: 'gong' }
+       */
+      function getEntityData(accountId) {
+        return {
+          sourceEntity: { type: ENTITY_TYPE, id: accountId },
+          variables: [{ name: ENTITY_TYPE_SINGULAR + '.id', value: accountId }],
+        };
+      }
+
+      function showError(message) {
+        var el = document.createElement('div');
+        el.className = 'loading error';
+        el.textContent = message;
+        var container = document.getElementById('pandadoc-container');
+        container.innerHTML = '';
+        container.appendChild(el);
+      }
+
+      function loadScript(src) {
+        return new Promise(function (resolve, reject) {
+          var script = document.createElement('script');
+          script.src = src;
+          script.onload = resolve;
+          script.onerror = reject;
+          document.head.appendChild(script);
+        });
+      }
+
+      async function ensurePandaDocSdk() {
+        if (typeof PandaDoc === 'undefined') {
+          await loadScript(PANDADOC_SDK_URL);
+        }
+      }
+
+      var documentsUI = null;
+      var wizardUI = null;
+      var processUI = null;
+
+      function getSdkData() {
+        var accountId = getGongAccountId();
+        return accountId ? getEntityData(String(accountId)) : {};
+      }
+
+      /**
+       * Renders the PandaDoc default view (workspace dropdown, Documents/Workflows tabs,
+       * "Create document" button) — the same view the Copper add-on uses.
+       *
+       * With an account id the list is scoped to that Gong account (documents created here
+       * are linked to it); without one (email composer) it shows the whole workspace.
+       * Clicking a document opens it in PandaDoc in a new tab. As in Copper,
+       * externalEditor: true — "Create document" is handled by this page (onDocumentCreate),
+       * which swaps the list for the DocEditor wizard.
+       */
+      async function renderPandaDoc() {
+        try {
+          await ensurePandaDocSdk();
+
+          var container = document.getElementById('pandadoc-container');
+          container.innerHTML = '';
+
+          documentsUI = new PandaDoc.DefaultView();
+          documentsUI.init({
+            el: container,
+            cssClass: 'pandadoc-gong',
+            initOptions: {
+              externalEditor: true,
+              isExternalRunner: true,
+              provider: PROVIDER,
+            },
+            data: getSdkData(),
+            events: {
+              onDocumentCreate: function () {
+                renderWizard();
+              },
+              onDocumentOpen: function (documentInfo) {
+                window.open(documentInfo.documentUrl, '_blank');
+              },
+              onWorkflowStart: function () {
+                renderProcess(null);
+              },
+              onWorkflowOpen: function (data) {
+                renderProcess({ id: data.process.id });
+              },
+            },
+          });
+        } catch (error) {
+          console.error('Error loading PandaDoc:', error);
+          showError('Failed to load PandaDoc. Please try again.');
+        }
+      }
+
+      /**
+       * "Create document" wizard, replacing the list in the same container (Copper runs it
+       * in a Copper modal; Gong has no modal API, so it's rendered in place). On close or
+       * after the document is created/sent, the list view is restored.
+       */
+      async function renderWizard() {
+        try {
+          await ensurePandaDocSdk();
+
+          var container = document.getElementById('pandadoc-container');
+          if (documentsUI) {
+            documentsUI.destroy();
+            documentsUI = null;
+          }
+          container.innerHTML = '';
+
+          var backToList = function () {
+            if (wizardUI) {
+              wizardUI.destroy();
+              wizardUI = null;
+            }
+            renderPandaDoc();
+          };
+
+          wizardUI = new PandaDoc.DocEditor();
+          wizardUI.show({
+            el: container,
+            cssClass: 'pandadoc-gong',
+            initOptions: {
+              hideCloseButton: false,
+              provider: PROVIDER,
+            },
+            data: getSdkData(),
+            events: {
+              onClose: backToList,
+              onDocumentCreated: backToList,
+              onDocumentSent: backToList,
+            },
+          });
+        } catch (error) {
+          console.error('Error loading PandaDoc wizard:', error);
+          showError('Failed to load document wizard. Please try again.');
+        }
+      }
+
+      /**
+       * Workflow runner, replacing the list in the same container (isExternalRunner: true
+       * makes the SDK hand workflows over to this page). `process` is `{ id }` to open an
+       * existing workflow, or null to start a new one (the runner shows its own picker).
+       *
+       * Unlike DocEditor, WorkflowRunner emits no close events, so a host-rendered
+       * "Back to documents" bar restores the list.
+       */
+      async function renderProcess(process) {
+        try {
+          await ensurePandaDocSdk();
+
+          var container = document.getElementById('pandadoc-container');
+          if (documentsUI) {
+            documentsUI.destroy();
+            documentsUI = null;
+          }
+          container.innerHTML = '';
+
+          var backToList = function () {
+            if (processUI) {
+              processUI.destroy();
+              processUI = null;
+            }
+            renderPandaDoc();
+          };
+
+          var backBar = document.createElement('div');
+          backBar.className = 'back-bar';
+          var backButton = document.createElement('button');
+          backButton.type = 'button';
+          backButton.textContent = '← Back';
+          backButton.addEventListener('click', backToList);
+          backBar.appendChild(backButton);
+          container.appendChild(backBar);
+
+          var runnerHost = document.createElement('div');
+          runnerHost.className = 'runner-host';
+          container.appendChild(runnerHost);
+
+          var data = getSdkData();
+          if (process) {
+            data.process = process;
+          }
+
+          processUI = new PandaDoc.WorkflowRunner();
+          processUI.init({
+            el: runnerHost,
+            cssClass: 'pandadoc-gong',
+            initOptions: {
+              isExternalRunner: false,
+              provider: PROVIDER,
+            },
+            data: data,
+          });
+        } catch (error) {
+          console.error('Error loading PandaDoc workflow:', error);
+          showError('Failed to load workflow. Please try again.');
+        }
+      }
+
+      window.onload = function () {
+        console.log(
+          'Gong iframe params:',
+          Object.fromEntries(new URLSearchParams(window.location.search)),
+          'accountId:',
+          getGongAccountId(),
+        );
+
+        gong
+          .ready()
+          .then(function () {
+            console.log('Gong is ready to interact with the app');
+          })
+          .catch(function (error) {
+            // Not fatal: allows the page to be opened outside Gong for debugging.
+            console.warn('Gong SDK handshake failed (running outside Gong?)', error);
+          });
+
+        renderPandaDoc();
+      };
+    </script>
+  </body>
+</html>

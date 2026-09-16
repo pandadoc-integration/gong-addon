@@ -1,1 +1,1 @@
-# gong-addon-2
+# gong-addon
