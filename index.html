@@ -197,39 +197,62 @@
       var gong = GongSdk.init({ gongWindow: window.parent });
       var PROVIDER = { name: 'gong' };
       // Entity type naming must match the Gong integration on the PandaDoc backend
-      // (Copper uses plurals like `companies`, HubSpot uses singular `company`).
-      var ENTITY_TYPE = 'accounts';
-      var ENTITY_TYPE_SINGULAR = 'account';
+      // (Copper uses plurals like `companies`/`opportunities`; HubSpot uses singular `company`).
+      var ACCOUNT_ENTITY_TYPE = 'accounts';
+      var OPPORTUNITY_ENTITY_TYPE = 'opportunities';
       var PANDADOC_SDK_URL = 'https://pd-js-sdk.s3.amazonaws.com/latest/pandadoc-js-sdk.js';
 
       /**
-       * Gong account id for the current iframe.
+       * Gong context for the current iframe.
        *
        * Gong appends `?account-id=<id>` when the integration is opened from the Engage
-       * Account tab or from a deal (the deal view reuses the same Account information
-       * iframe; Gong passes no deal id). The email composer passes nothing.
-       * Gong's docs spell the param `accountId`; the hyphenated form is what is sent.
+       * Account tab or from an opportunity, and `&opportunity-id=<id>` when opened from an
+       * opportunity. The email composer passes nothing.
+       *
+       * Returns { accountId, opportunityId } — either may be null.
        */
-      function getGongAccountId() {
+      function getGongContext() {
         var params = new URLSearchParams(window.location.search);
-        return params.get('account-id') || params.get('accountId') || null;
+        return {
+          accountId: params.get('account-id') || null,
+          opportunityId: params.get('opportunity-id') || null,
+        };
       }
 
       /**
-       * SDK `data` for a Gong account. The SDK app turns it into the Flow Wizard payload:
+       * SDK `data` for the current context. The SDK app turns sourceEntity/provider into
+       * the Flow Wizard payload:
        *
-       *   link_data:       { integration_name: 'gong', entity_type: 'accounts', entity_id }
+       *   link_data:       { integration_name: 'gong', entity_type, entity_id }
        *                    ← initOptions.provider + data.sourceEntity
-       *   init_data_items: [{ name: 'account.id', type: 'text', value: entity_id }]
-       *                    ← data.variables (Gong has no entity-data API, so the host page
-       *                      supplies whatever it knows; Gong only gives us the account id)
+       *   init_data_items: ← data.variables (Gong has no entity-data API, so the host page
+       *                      supplies whatever ids it has)
        *   trigger_details: { integration_name: 'gong' }
+       *
+       * With an opportunity id, the document is linked to the opportunity (source_entity);
+       * the account id — the opportunity's parent — is attached as document metadata
+       * instead (metadata is a flat string map, not a second linked entity).
+       * With only an account id, the document is linked to the account directly.
        */
-      function getEntityData(accountId) {
-        return {
-          sourceEntity: { type: ENTITY_TYPE, id: accountId },
-          variables: [{ name: ENTITY_TYPE_SINGULAR + '.id', value: accountId }],
-        };
+      function getSdkData(ctx) {
+        if (ctx.opportunityId) {
+          var data = {
+            sourceEntity: { type: OPPORTUNITY_ENTITY_TYPE, id: String(ctx.opportunityId) },
+            variables: [{ name: 'opportunity.id', value: String(ctx.opportunityId) }],
+          };
+          if (ctx.accountId) {
+            data.metadata = { account_id: String(ctx.accountId) };
+            data.variables.push({ name: 'account.id', value: String(ctx.accountId) });
+          }
+          return data;
+        }
+        if (ctx.accountId) {
+          return {
+            sourceEntity: { type: ACCOUNT_ENTITY_TYPE, id: String(ctx.accountId) },
+            variables: [{ name: 'account.id', value: String(ctx.accountId) }],
+          };
+        }
+        return {};
       }
 
       function showError(message) {
@@ -261,22 +284,34 @@
       var wizardUI = null;
       var processUI = null;
 
-      function getSdkData() {
-        var accountId = getGongAccountId();
-        return accountId ? getEntityData(String(accountId)) : {};
+      /**
+       * Entry point: picks the view for the current Gong context.
+       *
+       *  - opportunity id present  -> renderOpportunityView: documents for that opportunity
+       *    only, plus "Create document" (linked to the opportunity, account attached as
+       *    metadata).
+       *  - account id only        -> renderAccountList: documents for that account across
+       *    all its opportunities, read-only — no create button.
+       *  - neither (email composer, or opportunity id not sent yet) -> renderOpportunityView
+       *    with unfiltered data, same as before: whole workspace, with create button.
+       */
+      function renderPandaDoc() {
+        var ctx = getGongContext();
+        if (ctx.accountId && !ctx.opportunityId) {
+          renderAccountList(ctx);
+        } else {
+          renderOpportunityView(ctx);
+        }
       }
 
       /**
-       * Renders the PandaDoc default view (workspace dropdown, Documents/Workflows tabs,
-       * "Create document" button) — the same view the Copper add-on uses.
-       *
-       * With an account id the list is scoped to that Gong account (documents created here
-       * are linked to it); without one (email composer) it shows the whole workspace.
-       * Clicking a document opens it in PandaDoc in a new tab. As in Copper,
-       * externalEditor: true — "Create document" is handled by this page (onDocumentCreate),
-       * which swaps the list for the DocEditor wizard.
+       * Documents scoped to one opportunity (or, with no ids at all, the whole workspace) —
+       * workspace dropdown, Documents/Workflows tabs, "Create document" button. Clicking a
+       * document opens it in PandaDoc in a new tab. As in Copper, externalEditor: true —
+       * "Create document" is handled by this page (onDocumentCreate), which swaps the list
+       * for the DocEditor wizard.
        */
-      async function renderPandaDoc() {
+      async function renderOpportunityView(ctx) {
         try {
           await ensurePandaDocSdk();
 
@@ -292,19 +327,51 @@
               isExternalRunner: true,
               provider: PROVIDER,
             },
-            data: getSdkData(),
+            data: getSdkData(ctx),
             events: {
               onDocumentCreate: function () {
-                renderWizard();
+                renderWizard(ctx);
               },
               onDocumentOpen: function (documentInfo) {
                 window.open(documentInfo.documentUrl, '_blank');
               },
               onWorkflowStart: function () {
-                renderProcess(null);
+                renderProcess(ctx, null);
               },
               onWorkflowOpen: function (data) {
-                renderProcess({ id: data.process.id });
+                renderProcess(ctx, { id: data.process.id });
+              },
+            },
+          });
+        } catch (error) {
+          console.error('Error loading PandaDoc:', error);
+          showError('Failed to load PandaDoc. Please try again.');
+        }
+      }
+
+      /**
+       * Read-only document list for a Gong account with no opportunity id — every document
+       * linked to any of the account's opportunities, no create button (DocList in 'list'
+       * mode never renders one, unlike DefaultView).
+       */
+      async function renderAccountList(ctx) {
+        try {
+          await ensurePandaDocSdk();
+
+          var container = document.getElementById('pandadoc-container');
+          container.innerHTML = '';
+
+          documentsUI = new PandaDoc.DocList({ mode: 'list' });
+          documentsUI.init({
+            el: container,
+            cssClass: 'pandadoc-gong',
+            initOptions: {
+              provider: PROVIDER,
+            },
+            data: getSdkData(ctx),
+            events: {
+              onDocumentOpen: function (documentInfo) {
+                window.open(documentInfo.documentUrl, '_blank');
               },
             },
           });
@@ -319,7 +386,7 @@
        * in a Copper modal; Gong has no modal API, so it's rendered in place). On close or
        * after the document is created/sent, the list view is restored.
        */
-      async function renderWizard() {
+      async function renderWizard(ctx) {
         try {
           await ensurePandaDocSdk();
 
@@ -346,7 +413,7 @@
               hideCloseButton: false,
               provider: PROVIDER,
             },
-            data: getSdkData(),
+            data: getSdkData(ctx),
             events: {
               onClose: backToList,
               onDocumentCreated: backToList,
@@ -367,7 +434,7 @@
        * Unlike DocEditor, WorkflowRunner emits no close events, so a host-rendered
        * "Back to documents" bar restores the list.
        */
-      async function renderProcess(process) {
+      async function renderProcess(ctx, process) {
         try {
           await ensurePandaDocSdk();
 
@@ -399,7 +466,7 @@
           runnerHost.className = 'runner-host';
           container.appendChild(runnerHost);
 
-          var data = getSdkData();
+          var data = getSdkData(ctx);
           if (process) {
             data.process = process;
           }
@@ -421,12 +488,8 @@
       }
 
       window.onload = function () {
-        console.log(
-          'Gong iframe params:',
-          Object.fromEntries(new URLSearchParams(window.location.search)),
-          'accountId:',
-          getGongAccountId(),
-        );
+        console.log('Gong iframe params:', Object.fromEntries(new URLSearchParams(window.location.search)));
+        console.log('Detected context:', getGongContext());
 
         gong
           .ready()
