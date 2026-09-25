@@ -200,6 +200,9 @@
       // (Copper uses plurals like `companies`/`opportunities`; HubSpot uses singular `company`).
       var ACCOUNT_ENTITY_TYPE = 'accounts';
       var OPPORTUNITY_ENTITY_TYPE = 'opportunities';
+      // Document metadata key carrying the Gong account id. Written on every document
+      // created from an opportunity; the account view filters the list by it.
+      var ACCOUNT_METADATA_KEY = 'gong_account_id';
       var PANDADOC_SDK_URL = 'https://pd-js-sdk.s3.amazonaws.com/latest/pandadoc-js-sdk.js';
 
       /**
@@ -230,9 +233,13 @@
        *   trigger_details: { integration_name: 'gong' }
        *
        * With an opportunity id, the document is linked to the opportunity (source_entity);
-       * the account id — the opportunity's parent — is attached as document metadata
-       * instead (metadata is a flat string map, not a second linked entity).
-       * With only an account id, the document is linked to the account directly.
+       * the account id — the opportunity's parent — is written as document metadata
+       * (metadata is a flat string map, not a second linked entity).
+       *
+       * With only an account id, the same metadata key is used as a *filter*: DocList
+       * ignores sourceEntity (it queries documents/flat without an entity filter) but turns
+       * data.metadata into `documents/flat?metadata_<key>=<value>`, so the account view
+       * lists every document created from any of the account's opportunities.
        */
       function getSdkData(ctx) {
         if (ctx.opportunityId) {
@@ -241,16 +248,20 @@
             variables: [{ name: 'opportunity.id', value: String(ctx.opportunityId) }],
           };
           if (ctx.accountId) {
-            data.metadata = { account_id: String(ctx.accountId) };
+            data.metadata = {};
+            data.metadata[ACCOUNT_METADATA_KEY] = String(ctx.accountId);
             data.variables.push({ name: 'account.id', value: String(ctx.accountId) });
           }
           return data;
         }
         if (ctx.accountId) {
-          return {
+          var accountData = {
             sourceEntity: { type: ACCOUNT_ENTITY_TYPE, id: String(ctx.accountId) },
             variables: [{ name: 'account.id', value: String(ctx.accountId) }],
+            metadata: {},
           };
+          accountData.metadata[ACCOUNT_METADATA_KEY] = String(ctx.accountId);
+          return accountData;
         }
         return {};
       }
@@ -351,8 +362,9 @@
 
       /**
        * Read-only document list for a Gong account with no opportunity id — every document
-       * linked to any of the account's opportunities, no create button (DocList in 'list'
-       * mode never renders one, unlike DefaultView).
+       * created from any of the account's opportunities (matched via the gong_account_id
+       * metadata, see getSdkData), no create button (DocList in 'list' mode never renders
+       * one, unlike DefaultView).
        */
       async function renderAccountList(ctx) {
         try {
